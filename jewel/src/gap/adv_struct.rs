@@ -11,6 +11,8 @@ use uuid::*;
 
 use defmt::Format;
 
+use crate::phy::MAX_PDU_LENGTH;
+
 #[derive(Debug, Clone, PartialEq, Eq, Format, Default)]
 #[non_exhaustive]
 pub struct AdvData<'a> {
@@ -61,7 +63,7 @@ impl<'a> AdvData<'a> {
 }
 
 impl<'a> AdvData<'a> {
-    pub(crate) fn bytes(&self, dest: &mut [u8]) -> usize {
+    pub fn bytes(&self, dest: &mut [u8]) -> usize {
         let mut start = 0;
         if let Some(flags) = &self.flags {
             start += 1;

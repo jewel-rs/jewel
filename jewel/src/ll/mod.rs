@@ -3,12 +3,14 @@ mod adv;
 
 pub use address::*;
 pub use adv::*;
-use embassy_time::{Duration, Instant, Timer};
+use embassy_time::{with_deadline, Duration, Instant, Timer};
 
 use rand::{rngs::SmallRng, Rng, SeedableRng};
 
 use crate::phy::Mode::Ble1mbit;
-use crate::phy::{AdvertisingChannel, HeaderSize, Radio, ADV_ADDRESS, ADV_CRC_INIT, CRC_POLY};
+use crate::phy::{
+    AdvertisingChannel, HeaderSize, Radio, ADV_ADDRESS, ADV_CRC_INIT, CRC_POLY, MAX_PDU_LENGTH,
+};
 
 ///  Inter Frame Space
 ///  The time interval between two consecutive packets on the same channel index
@@ -57,62 +59,89 @@ const RANGE_DELAY: Duration = Duration::from_nanos(2 * PROPAGATION_DISTANCE * 4)
 // Ref: https://www.bluetooth.com/wp-content/uploads/Files/Specification/HTML/Core-54/out/en/low-energy-controller/link-layer-specification.html#UUID-fed93539-5fa3-b4de-4789-1b8a1b48fa13
 
 // pattern from https://hoverbear.org/blog/rust-state-machine-pattern/
-pub struct LinkLayer<'r, R: Radio, S = Standby> {
+pub struct LinkLayer<'r, R: Radio> {
     radio: &'r mut R,
-    state: S,
 }
 
-impl<'r, R: Radio> LinkLayer<'r, R, Standby> {
+impl<'r, R: Radio> LinkLayer<'r, R> {
     pub fn new(radio: &'r mut R) -> Self {
-        LinkLayer::<R> {
-            radio,
-            state: Standby {},
-        }
+        LinkLayer::<R> { radio }
     }
-}
 
-impl<'r, R: Radio> LinkLayer<'r, R, Standby> {
-    pub fn advertise<'a>(
-        self,
-        interval: Duration,
-
-        // needs to alive for the lifetime of the advertising
-        data: &'a [u8],
-    ) -> LinkLayer<'r, R, Advertising<'a, SmallRng>> {
-        let rng = SmallRng::seed_from_u64(42);
-
+    fn setup_legacy_adv(&mut self) {
         self.radio.set_mode(Ble1mbit);
         self.radio.set_tx_power(0);
         self.radio.set_header_size(HeaderSize::TwoBytes);
         self.radio.set_access_address(ADV_ADDRESS);
         self.radio.set_crc_init(ADV_CRC_INIT);
         self.radio.set_crc_poly(CRC_POLY);
+    }
 
-        LinkLayer {
-            radio: self.radio,
-            state: Advertising::<'a>::new(rng, interval, data),
+    pub async fn adv_nonconnectable_nonscannable_undirected<'a>(
+        mut self,
+        interval: Duration,
+
+        adv_data: &'a [u8],
+    ) -> Result<(), R::Error> {
+        let rng = SmallRng::seed_from_u64(42);
+
+        self.setup_legacy_adv();
+        let mut timer = AdvertisingTimer::new(rng, interval);
+
+        let addr = self.radio.device_address();
+        let data_pdu = AdvNonconnInd::new(addr, adv_data);
+
+        let mut data_pdu_buffer = [0u8; MAX_PDU_LENGTH];
+        data_pdu.bytes(&mut data_pdu_buffer);
+
+        loop {
+            Timer::at(timer.next_event()).await;
+
+            for channel in AdvertisingChannel::channels() {
+                self.radio.set_channel(channel.into());
+                self.radio.transmit(&data_pdu_buffer).await?;
+            }
         }
+    }
+
+    pub async fn adv_nonconnectable_scannable_undirected<'a>(
+        mut self,
+        interval: Duration,
+
+        adv_data: &'a [u8],
+        scan_data: &'a [u8],
+    ) -> Result<(), R::Error> {
+        let rng = SmallRng::seed_from_u64(42);
+
+        self.setup_legacy_adv();
+        let mut timer = AdvertisingTimer::new(rng, interval);
+
+        let addr = self.radio.device_address();
+        let data_pdu = AdvNonconnInd::new(addr, adv_data);
+
+        let mut data_pdu_buffer = [0u8; MAX_PDU_LENGTH];
+        data_pdu.bytes(&mut data_pdu_buffer);
+
+        Timer::at(timer.next_event()).await;
+        loop {
+            for channel in AdvertisingChannel::channels() {
+                self.radio.set_channel(channel.into());
+                self.radio.transmit(&data_pdu_buffer).await?;
+            }
+
+            // while waiting for the next advertising event
+            // we can receive scan requests
+            let _ = with_deadline(timer.next_event(), self.receive_scan()).await;
+        }
+    }
+
+    async fn receive_scan(&mut self) {
+        let mut rcv_buffer = [0u8; MAX_PDU_LENGTH];
+        let _ = self.radio.receive(&mut rcv_buffer).await;
     }
 }
 
-impl<'r, R: Radio, RNG: Rng> LinkLayer<'r, R, Advertising<'_, RNG>> {
-    /// Transmit the advertising data on all advertising channels
-    /// You should call this method in a loop to keep advertising with at max the interal time
-    pub async fn transmit(&mut self) -> Result<(), R::Error> {
-        Timer::at(self.state.event).await;
-        self.state.event = self.state.next_event();
-
-        for channel in AdvertisingChannel::channels() {
-            self.radio.set_channel(channel.into());
-            self.radio.transmit(&self.state.data).await?;
-        }
-
-        Ok(())
-    }
-}
-
-pub struct Standby {}
-pub struct Advertising<'a, RNG: Rng> {
+pub struct AdvertisingTimer<RNG: Rng> {
     /// Pseudo-random value used to generate the advDelay between each advertising event
     rng: RNG,
 
@@ -122,31 +151,31 @@ pub struct Advertising<'a, RNG: Rng> {
     interval: Duration,
 
     event: Instant,
-
-    data: &'a [u8],
 }
 
-impl<'a, RNG: Rng> Advertising<'a, RNG> {
-    pub fn new(rng: RNG, interval: Duration, data: &'a [u8]) -> Self {
+impl<RNG: Rng> AdvertisingTimer<RNG> {
+    pub fn new(rng: RNG, interval: Duration) -> Self {
         assert!(interval >= Duration::from_micros(20_000));
         assert!(interval <= Duration::from_micros(10_485_759_375));
 
-        // Data should be set in the radio before starting the advertising
-        Advertising {
+        Self {
             rng,
             interval,
             event: Instant::now(),
-            data,
         }
     }
 
     /// The advDelay is a (pseudo-)random value with a range 0 ms to 10 ms generated by the Link Layer for each advertising event.
-    fn delay(&mut self) -> Duration {
+    fn rng_delay(&mut self) -> Duration {
         let delay = self.rng.gen_range(0..10_000);
         Duration::from_micros(delay)
     }
 
+    /// Returns the next advertising event instant and updates the internal state
     fn next_event(&mut self) -> Instant {
-        self.event + self.interval + self.delay()
+        let event = self.event;
+
+        self.event = event + self.interval + self.rng_delay();
+        event
     }
 }

@@ -2,7 +2,7 @@
 #![allow(dead_code)] // while in development
 
 pub mod gap;
-pub(crate) mod ll;
+pub mod ll;
 pub mod phy;
 
 pub use gap::*;
